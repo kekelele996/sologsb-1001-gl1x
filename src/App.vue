@@ -4,10 +4,11 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
-  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
+  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled, Warning,
 } from '@element-plus/icons-vue'
-import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import { useEditorStore, DRAFT_PRESETS, guessDraftLanguage } from './store/editor'
+import type { Cue, CueConflict, PendingItem, TargetEntry, TargetLinkStatus } from './types'
+import type { MessageKey } from './i18n'
 import { formatTime } from './utils/subtitle'
 
 const store = useEditorStore()
@@ -17,14 +18,42 @@ const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
 
+// 译稿导入
+const draftDialog = ref(false)
+const draftFileInput = ref<HTMLInputElement>()
+const draftLanguage = ref('en-US')
+const draftFileName = ref('')
+const draftText = ref('')
+
+// 导出前检查
+const exportDialog = ref(false)
+const exportEmpty = ref<string[]>([])
+const exportPending = ref<string[]>([])
+
+// 待确认面板中各行临时选择的归属
+const assignChoice = ref<Record<string, string>>({})
+const attachChoice = ref<Record<string, string>>({})
+
+const activeDraftId = computed(() => project.value.activeDraftId)
+const activeDraftSelect = computed({
+  get: () => project.value.activeDraftId ?? 'base',
+  set: (value: string) => store.setActiveDraft(value === 'base' ? null : value),
+})
+
+const targetOf = (cue: Cue): string => store.targetText(cue)
+const linkStatusOf = (cue: Cue): TargetLinkStatus | undefined => store.targetStatusOf(cue)
+
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
-  if (!query) return visibleCues.value
-  return visibleCues.value.filter((cue) => `${cue.source} ${cue.target}`.toLowerCase().includes(query))
+  const list = visibleCues.value
+  if (!query) return list
+  return list.filter((cue) => `${cue.source} ${cue.targets[project.value.activeDraftId ?? ''] ?? ''}`.toLowerCase().includes(query))
 })
+const selectedTarget = computed(() => (selectedCue.value ? targetOf(selectedCue.value) : ''))
 const selectedWarnings = computed(() => selectedCue.value ? cueWarnings(selectedCue.value) : [])
 const selectedTermMismatches = computed(() => selectedCue.value ? termMismatches(selectedCue.value) : [])
-const totalCharacters = computed(() => project.value.cues.reduce((sum, cue) => sum + cue.source.length + cue.target.length, 0))
+const totalCharacters = computed(() =>
+  project.value.cues.reduce((sum, cue) => sum + cue.source.length + (cue.targets[project.value.activeDraftId ?? '']?.length ?? 0), 0))
 const saveLabel = computed(() => ({
   saved: store.t('saved'), dirty: store.t('dirty'), saving: store.t('saving'), conflict: store.t('conflict'),
 }[saveState.value]))
@@ -33,8 +62,46 @@ const actorName = (id: string) => project.value.actors.find((actor) => actor.id 
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
 
+const linkTagType = (status?: TargetLinkStatus) => status === 'matched' ? 'success' : status === 'pending' ? 'warning' : 'info'
+const linkTagLabel = (status?: TargetLinkStatus) =>
+  status === 'matched' ? store.t('statusMatched') : status === 'pending' ? store.t('statusPending') : store.t('statusEmpty')
+
+/** 当前视图下的待确认项：底稿视图显示全部语言稿，语言稿视图只显示该语言 */
+const pendingItemsView = computed<PendingItem[]>(() =>
+  activeDraftId.value
+    ? project.value.pendingItems.filter((item) => item.draftId === activeDraftId.value)
+    : project.value.pendingItems,
+)
+
+const reasonLabelMap: Record<PendingItem['reason'], MessageKey> = {
+  ambiguous: 'reasonAmbiguous',
+  missing: 'reasonMissing',
+  offset: 'reasonOffset',
+  'time-changed': 'reasonTimeChanged',
+}
+const reasonLabel = (reason: PendingItem['reason']) => store.t(reasonLabelMap[reason])
+const reasonTagType = (reason: PendingItem['reason']) =>
+  reason === 'ambiguous' ? 'danger' : reason === 'missing' ? 'warning' : reason === 'offset' ? 'info' : 'warning'
+
+const cueIndex = (cueId?: string) => project.value.cues.findIndex((cue) => cue.id === cueId)
+const cueRef = (cueId?: string) => {
+  const index = cueIndex(cueId)
+  return index < 0 ? '' : store.t('cueRef', { index: index + 1 })
+}
+const cueShort = (cueId?: string) => {
+  const cue = project.value.cues.find((item) => item.id === cueId)
+  return cue ? `${cueRef(cueId)} · ${formatTime(cue.start)}` : ''
+}
+const entryOf = (item: PendingItem): TargetEntry | undefined =>
+  project.value.looseEntries.find((entry) => entry.id === item.entryId)
+const draftOf = (draftId: string) => project.value.drafts.find((draft) => draft.id === draftId)
+const looseEntriesFor = (item: PendingItem) => project.value.looseEntries.filter((entry) => entry.draftId === item.draftId)
+
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
   if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
+}
+function updateTarget(text: string) {
+  if (selectedCue.value) store.updateTarget(selectedCue.value.id, text)
 }
 function tone(text: string) {
   const polite = (text.match(/您|请|劳驾|麻烦|敬请/g) ?? []).length
@@ -54,8 +121,8 @@ function cueWarnings(cue: Cue): CueConflict[] {
   const warnings: CueConflict[] = []
   if (!previous) return warnings
   if (previous.actorId !== cue.actorId) warnings.push({ cueId: cue.id, type: 'actor', message: store.t('actorSwitch', { from: actorName(previous.actorId), to: actorName(cue.actorId) }) })
-  const fromTone = tone(previous.target || previous.source)
-  const currentTone = tone(cue.target || cue.source)
+  const fromTone = tone(targetOf(previous) || previous.source)
+  const currentTone = tone(targetOf(cue) || cue.source)
   if (fromTone !== 'neutral' && currentTone !== 'neutral' && fromTone !== currentTone) warnings.push({ cueId: cue.id, type: 'tone', message: store.t('toneSwitch', { from: fromTone, to: currentTone }) })
   const fromAddress = addressee(previous.source)
   const currentAddress = addressee(cue.source)
@@ -64,7 +131,8 @@ function cueWarnings(cue: Cue): CueConflict[] {
   return warnings
 }
 function termMismatches(cue: Cue) {
-  return project.value.terms.filter((term) => cue.termIds.includes(term.id) && cue.target && !cue.target.includes(term.target))
+  const target = targetOf(cue)
+  return project.value.terms.filter((term) => cue.termIds.includes(term.id) && target && !target.includes(term.target))
 }
 async function importFile(event: Event) {
   const input = event.target as HTMLInputElement
@@ -79,6 +147,56 @@ async function importFile(event: Event) {
     input.value = ''
   }
 }
+function openDraftDialog() {
+  if (!project.value.cues.length) {
+    ElMessage.warning(store.t('importDraftBase'))
+    return
+  }
+  draftFileName.value = ''
+  draftText.value = ''
+  draftLanguage.value = project.value.activeDraftId
+    ? draftOf(activeDraftId.value!)?.language ?? 'en-US'
+    : guessDraftLanguage('')
+  draftDialog.value = true
+  nextTick(() => draftFileInput.value?.click())
+}
+async function onDraftFileChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  draftText.value = await file.text()
+  draftFileName.value = file.name
+  draftLanguage.value = guessDraftLanguage(file.name)
+}
+function confirmDraftImport() {
+  if (!draftText.value) {
+    ElMessage.error(store.t('importError'))
+    return
+  }
+  try {
+    const result = store.importDraftSrt(draftText.value, draftLanguage.value, '')
+    ElMessage.success(store.t('draftImportDone', {
+      language: draftLanguage.value,
+      matched: result.matched,
+      pending: result.pending,
+    }))
+    draftDialog.value = false
+  } catch {
+    ElMessage.error(store.t('importError'))
+  }
+}
+function doAssign(item: PendingItem) {
+  const cueId = assignChoice.value[item.id]
+  if (!cueId) return
+  store.assignPending(item.id, cueId)
+  delete assignChoice.value[item.id]
+}
+function doAttach(item: PendingItem) {
+  const entryId = attachChoice.value[item.id]
+  if (!entryId) return
+  store.attachLooseEntry(item.id, entryId)
+  delete attachChoice.value[item.id]
+}
 function requestDelete(id: string) {
   ElMessageBox.confirm(store.t('confirmDelete'), { type: 'warning', confirmButtonText: store.t('delete') })
     .then(() => store.deleteCue(id))
@@ -89,6 +207,36 @@ function createSnapshot() {
   snapshotName.value = ''
   snapshotDialog.value = false
   ElMessage.success(store.t('savedNow'))
+}
+function requestExport() {
+  const issues = store.exportIssues(activeDraftId.value)
+  if (!issues.emptyCueIds.length && !issues.pendingIds.length) {
+    store.exportSrt(activeDraftId.value)
+    return
+  }
+  exportEmpty.value = issues.emptyCueIds
+  exportPending.value = issues.pendingIds
+  exportDialog.value = true
+}
+function confirmExport() {
+  store.exportSrt(activeDraftId.value)
+  exportDialog.value = false
+}
+const pendingById = (id: string) => project.value.pendingItems.find((item) => item.id === id)
+function pendingTagText(id: string) {
+  const item = pendingById(id)
+  if (!item) return store.t('looseEntryHint')
+  const where = cueRef(item.cueId)
+  const entry = entryOf(item)
+  const tail = where || (entry ? store.t('entryLabel', { order: entry.order }) : store.t('looseEntryHint'))
+  return `${reasonLabel(item.reason)} · ${tail}`
+}
+function jumpToPending(id: string) {
+  const item = pendingById(id)
+  if (item?.cueId) {
+    store.selectCue(item.cueId)
+    exportDialog.value = false
+  }
 }
 function onKeydown(event: KeyboardEvent) {
   const target = event.target as HTMLElement
@@ -137,6 +285,14 @@ const handleOffline = () => setOnline(false)
         </div>
       </div>
       <div class="top-actions">
+        <el-select v-model="activeDraftSelect" size="small" class="draft-select">
+          <el-option :label="store.t('baseOnly')" value="base" />
+          <el-option
+            v-for="draft in project.drafts" :key="draft.id"
+            :label="`${store.draftLabel(draft)}${store.pendingCount(draft.id) ? ` · ${store.t('pendingBadge', { count: store.pendingCount(draft.id) })}` : ''}`"
+            :value="draft.id"
+          />
+        </el-select>
         <el-select v-model="project.language" size="small" class="language-select" @change="store.setLocale">
           <el-option label="简体中文" value="zh-CN" />
           <el-option label="English" value="en-US" />
@@ -145,7 +301,7 @@ const handleOffline = () => setOnline(false)
         <span class="save-state" :class="saveState"><i />{{ saveLabel }}</span>
         <input ref="fileInput" class="file-input" type="file" accept=".srt,.txt,text/plain" @change="importFile" />
         <el-button :icon="UploadFilled" @click="fileInput?.click()">{{ store.t('import') }}</el-button>
-        <el-button :icon="Download" @click="store.exportSrt">{{ store.t('export') }}</el-button>
+        <el-button :icon="Download" @click="requestExport">{{ store.t('export') }}</el-button>
         <el-button type="primary" :icon="DocumentCopy" @click="snapshotDialog = true">{{ store.t('snapshot') }}</el-button>
       </div>
     </header>
@@ -165,6 +321,25 @@ const handleOffline = () => setOnline(false)
 
     <main class="workspace">
       <aside class="left-panel panel">
+        <section>
+          <div class="section-heading">
+            <span><el-icon><Files /></el-icon>{{ store.t('drafts') }}</span>
+            <el-button size="small" text type="primary" @click="openDraftDialog">{{ store.t('addDraft') }}</el-button>
+          </div>
+          <button class="actor-filter" :class="{ active: activeDraftSelect === 'base' }" @click="activeDraftSelect = 'base'">
+            <span class="actor-dot all" />{{ store.t('baseOnly') }}
+            <b>{{ project.cues.length }}</b>
+          </button>
+          <button
+            v-for="draft in project.drafts" :key="draft.id"
+            class="actor-filter" :class="{ active: activeDraftId === draft.id }"
+            @click="store.setActiveDraft(draft.id)"
+          >
+            <span class="actor-dot" :class="{ pending: store.pendingCount(draft.id) > 0 }" />
+            {{ store.draftLabel(draft) }}
+            <b v-if="store.pendingCount(draft.id)" class="pending-count">{{ store.t('pendingBadge', { count: store.pendingCount(draft.id) }) }}</b>
+          </button>
+        </section>
         <section>
           <div class="section-heading">
             <span><el-icon><Files /></el-icon>{{ store.t('actors') }}</span>
@@ -215,11 +390,72 @@ const handleOffline = () => setOnline(false)
           <div class="timeline-scroll">
             <div class="timeline" :style="{ width: `${timelineZoom * 100}%` }">
               <button
-                v-for="cue in filteredCues" :key="cue.id" class="timeline-block" :class="{ active: cue.id === selectedCueId, issue: cue.status === 'issue', locked: cue.locked }"
+                v-for="cue in filteredCues" :key="cue.id" class="timeline-block" :class="{ active: cue.id === selectedCueId, issue: cue.status === 'issue', locked: cue.locked, pending: linkStatusOf(cue) === 'pending' }"
                 :style="{ left: `${(cue.start / store.totalDuration) * 100}%`, width: `${Math.max(1.8, ((cue.end - cue.start) / store.totalDuration) * 100)}%`, borderColor: actorColor(cue.actorId) }"
                 :title="`${formatTime(cue.start)} · ${cue.source}`" @click="store.selectCue(cue.id)"
-              ><span>{{ actorName(cue.actorId).split('/')[0] }}</span><b>{{ cue.target || cue.source }}</b></button>
+              ><span>{{ actorName(cue.actorId).split('/')[0] }}</span><b>{{ targetOf(cue) || cue.source }}</b></button>
               <div class="timeline-ruler"><span v-for="tick in [0, 15, 30, 45, 60]" :key="tick" :style="{ left: `${(tick / store.totalDuration) * 100}%` }">{{ tick }}s</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="pendingItemsView.length" class="pending-card">
+          <div class="section-heading">
+            <span class="pending-heading"><el-icon><Warning /></el-icon>{{ store.t('pendingReview', { count: pendingItemsView.length }) }}</span>
+            <el-button size="small" text type="primary" @click="openDraftDialog">{{ store.t('addDraft') }}</el-button>
+          </div>
+          <div v-for="item in pendingItemsView" :key="item.id" class="pending-row">
+            <div class="pending-info">
+              <el-tag size="small" :type="reasonTagType(item.reason)">{{ reasonLabel(item.reason) }}</el-tag>
+              <el-tag v-if="!activeDraftId" size="small" effect="plain">{{ draftOf(item.draftId) ? store.draftLabel(draftOf(item.draftId)!) : item.draftId }}</el-tag>
+              <div v-if="entryOf(item)" class="pending-entry">
+                <b>{{ store.t('entryLabel', { order: entryOf(item)!.order }) }}</b>
+                <code>{{ item.detail }}</code>
+                <p>{{ entryOf(item)!.text }}</p>
+              </div>
+              <div v-else-if="item.cueId" class="pending-entry">
+                <b>{{ cueShort(item.cueId) }}</b>
+              </div>
+              <div v-else class="pending-entry">
+                <b>{{ store.t('looseEntryHint') }}</b>
+                <code>{{ item.detail }}</code>
+              </div>
+            </div>
+            <div class="pending-actions">
+              <template v-if="entryOf(item)">
+                <el-select
+                  :model-value="assignChoice[item.id] ?? ''" size="small" class="assign-select"
+                  :placeholder="store.t('assignToCue')"
+                  @change="(value: string) => assignChoice[item.id] = value"
+                >
+                  <el-option
+                    v-for="(cue, ci) in project.cues" :key="cue.id"
+                    :label="`${store.t('cueRef', { index: ci + 1 })} · ${formatTime(cue.start)} · ${cue.source.slice(0, 18)}`"
+                    :value="cue.id"
+                  />
+                </el-select>
+                <el-button size="small" type="primary" :disabled="!assignChoice[item.id]" @click="doAssign(item)">{{ store.t('assign') }}</el-button>
+                <el-button size="small" text @click="store.discardPending(item.id)">{{ store.t('discardEntry') }}</el-button>
+              </template>
+              <template v-else-if="item.reason === 'missing'">
+                <el-select
+                  :model-value="attachChoice[item.id] ?? ''" size="small" class="assign-select"
+                  :placeholder="store.t('assignToCue')"
+                  @change="(value: string) => attachChoice[item.id] = value"
+                >
+                  <el-option
+                    v-for="entry in looseEntriesFor(item)" :key="entry.id"
+                    :label="`${store.t('entryLabel', { order: entry.order })} · ${formatTime(entry.start)} · ${entry.text.slice(0, 18)}`"
+                    :value="entry.id"
+                  />
+                </el-select>
+                <el-button size="small" type="primary" :disabled="!attachChoice[item.id]" @click="doAttach(item)">{{ store.t('assign') }}</el-button>
+                <el-button size="small" @click="store.markEmpty(item.id)">{{ store.t('markEmpty') }}</el-button>
+              </template>
+              <template v-else-if="item.reason === 'time-changed'">
+                <el-button size="small" type="primary" @click="store.confirmPending(item.id)">{{ store.t('confirmLink') }}</el-button>
+                <el-button size="small" @click="store.markEmpty(item.id)">{{ store.t('markEmpty') }}</el-button>
+              </template>
             </div>
           </div>
         </div>
@@ -244,11 +480,12 @@ const handleOffline = () => setOnline(false)
                 <span class="actor-pill" :style="{ '--actor': actorColor(cue.actorId) }">{{ actorName(cue.actorId) }}</span>
                 <code>{{ formatTime(cue.start) }} → {{ formatTime(cue.end) }}</code>
                 <el-tag size="small" :type="statusType(cue.status)">{{ statusLabel(cue.status) }}</el-tag>
+                <el-tag v-if="activeDraftId" size="small" :type="linkTagType(linkStatusOf(cue))">{{ linkTagLabel(linkStatusOf(cue)) }}</el-tag>
                 <el-icon v-if="cue.locked"><Lock /></el-icon>
                 <span class="cue-warning-count" v-if="cueWarnings(cue).length">{{ cueWarnings(cue).length }} context</span>
               </div>
               <p class="source-text">{{ cue.source }}</p>
-              <p class="target-text" :class="{ empty: !cue.target }">{{ cue.target || '尚未填写译文' }}</p>
+              <p v-if="activeDraftId" class="target-text" :class="{ empty: !targetOf(cue) }">{{ targetOf(cue) || store.t('emptyTarget') }}</p>
             </div>
             <div class="cue-quick-actions">
               <el-button size="small" text :icon="MagicStick" @click.stop="store.splitCue(cue.id)">{{ store.t('split') }}</el-button>
@@ -269,6 +506,12 @@ const handleOffline = () => setOnline(false)
           <template v-if="selectedCue.locked">
             <div class="locked-note"><el-icon><Lock /></el-icon>{{ store.t('locked') }}</div>
           </template>
+          <div v-if="activeDraftId" class="draft-inspector-line">
+            <el-tag size="small" :type="linkTagType(linkStatusOf(selectedCue))">{{ linkTagLabel(linkStatusOf(selectedCue)) }}</el-tag>
+            <span v-if="project.drafts.find((draft) => draft.id === activeDraftId)">
+              {{ store.draftLabel(project.drafts.find((draft) => draft.id === activeDraftId)!) }}
+            </span>
+          </div>
           <label>{{ store.t('actor') }}</label>
           <el-select :model-value="selectedCue.actorId" :disabled="selectedCue.locked" @change="updateSelected({ actorId: String($event) }, 'actor')">
             <el-option v-for="actor in project.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
@@ -280,7 +523,12 @@ const handleOffline = () => setOnline(false)
           <label>{{ store.t('source') }}</label>
           <el-input :model-value="selectedCue.source" type="textarea" :rows="4" :disabled="selectedCue.locked" @change="updateSelected({ source: String($event) }, 'source-text')" />
           <label>{{ store.t('target') }}</label>
-          <el-input :model-value="selectedCue.target" type="textarea" :rows="5" :disabled="selectedCue.locked" @change="updateSelected({ target: String($event) }, 'target-text')" />
+          <el-input
+            :model-value="selectedTarget" type="textarea" :rows="5"
+            :disabled="selectedCue.locked || !activeDraftId"
+            :placeholder="activeDraftId ? store.t('emptyTarget') : store.t('baseOnly')"
+            @change="updateTarget(String($event))"
+          />
           <div class="two-columns">
             <div><label>{{ store.t('speed') }}</label><el-input-number :model-value="selectedCue.speed" :disabled="selectedCue.locked" :min="0.5" :max="1.8" :step="0.01" controls-position="right" @change="updateSelected({ speed: Number($event) }, 'speed')" /></div>
             <div><label>{{ store.t('status') }}</label><el-select :model-value="selectedCue.status" :disabled="selectedCue.locked" @change="store.markStatus(selectedCue.id, $event)"><el-option :label="store.t('draft')" value="draft" /><el-option :label="store.t('reviewed')" value="reviewed" /><el-option :label="store.t('issue')" value="issue" /></el-select></div>
@@ -328,6 +576,51 @@ const handleOffline = () => setOnline(false)
         <p v-if="!project.snapshots.length" class="empty-state">{{ store.t('noSnapshots') }}</p>
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
+    </el-dialog>
+
+    <el-dialog v-model="draftDialog" :title="store.t('importDraftTitle')" width="520px">
+      <div class="draft-dialog-body">
+        <label>{{ store.t('importDraftLanguage') }}</label>
+        <el-select v-model="draftLanguage">
+          <el-option
+            v-for="preset in DRAFT_PRESETS" :key="preset.language"
+            :label="preset.labels[project.language]" :value="preset.language"
+          />
+        </el-select>
+        <label>{{ store.t('importDraftFile') }}</label>
+        <input ref="draftFileInput" class="file-input" type="file" accept=".srt,text/plain" @change="onDraftFileChange" />
+        <el-button :icon="UploadFilled" @click="draftFileInput?.click()">{{ store.t('importDraftFile') }}</el-button>
+        <span v-if="draftFileName" class="draft-file-name">{{ draftFileName }}</span>
+        <p v-if="!project.cues.length" class="check-warning">{{ store.t('importDraftBase') }}</p>
+      </div>
+      <template #footer>
+        <el-button @click="draftDialog = false">{{ store.t('cancel') }}</el-button>
+        <el-button type="primary" :disabled="!draftText" @click="confirmDraftImport">{{ store.t('importDraftStart') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="exportDialog" :title="store.t('exportTitle', { language: activeDraftId && project.drafts.find((draft) => draft.id === activeDraftId) ? store.draftLabel(project.drafts.find((draft) => draft.id === activeDraftId)!) : store.t('baseOnly') })" width="520px">
+      <p class="check-warning">
+        {{ store.t('exportBlocked', { empty: exportEmpty.length, pending: exportPending.length }) }}
+      </p>
+      <div v-if="exportEmpty.length" class="export-list">
+        <b>{{ store.t('exportEmptyTitle') }}</b>
+        <el-tag
+          v-for="cueId in exportEmpty" :key="cueId" size="small" type="info" class="export-tag"
+          @click="store.selectCue(cueId)"
+        >{{ cueRef(cueId) }}</el-tag>
+      </div>
+      <div v-if="exportPending.length" class="export-list">
+        <b>{{ store.t('exportPendingTitle') }}</b>
+        <el-tag
+          v-for="itemId in exportPending" :key="itemId" size="small" :type="reasonTagType(pendingById(itemId)?.reason ?? 'offset')" class="export-tag"
+          @click="jumpToPending(itemId)"
+        >{{ pendingTagText(itemId) }}</el-tag>
+      </div>
+      <template #footer>
+        <el-button @click="exportDialog = false">{{ store.t('cancel') }}</el-button>
+        <el-button type="danger" @click="confirmExport">{{ store.t('exportAnyway') }}</el-button>
+      </template>
     </el-dialog>
   </div>
 </template>
