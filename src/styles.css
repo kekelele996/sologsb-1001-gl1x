@@ -73,6 +73,9 @@ button, input, textarea { font: inherit; }
 .timeline-ruler { position: absolute; left: 0; right: 0; top: 67px; }
 .timeline-ruler span { position: absolute; color: #98a3b4; font-size: 9px; }
 .cue-toolbar { display: flex; align-items: center; justify-content: space-between; margin: 18px 2px 8px; }
+.cue-toolbar-right { display: flex; align-items: center; gap: 8px; }
+.active-lang-label { color: #647187; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.active-lang-select { width: 110px; }
 .cue-search { width: 230px; }
 .actor-mobile-filter { display: none; }
 .cue-list { display: grid; gap: 7px; }
@@ -114,6 +117,33 @@ kbd { padding: 2px 5px; border: 1px solid #5a6981; border-radius: 4px; color: wh
 .snapshot-item { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #edf0f4; }
 .snapshot-item div { display: flex; flex-direction: column; gap: 3px; }
 .snapshot-item small, .snapshot-item span { color: #7b8799; font-size: 11px; }
+.lang-chips { display: inline-flex; gap: 4px; margin-left: 2px; }
+.lang-chip { padding: 1px 5px; border: 1px solid #d7dee9; border-radius: 5px; color: #a3adbd; background: #f4f6fa; font-size: 9px; font-style: normal; font-weight: 700; letter-spacing: .03em; }
+.lang-chip.filled { color: #2f6fed; border-color: #b9cdec; background: #edf3ff; }
+.lang-chip.pending { color: #ad6610; border-color: #ecd3a8; background: #fdf3e0; }
+.lang-chip.current { box-shadow: 0 0 0 1.5px currentColor inset; }
+.state-tag { margin-left: 6px; vertical-align: 1px; }
+.translation-heading { display: flex; align-items: center; gap: 8px; margin-top: 5px; }
+.translation-heading label { margin-top: 0; flex: 1; }
+.inspector-lang-select { width: 108px; }
+.import-mode { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-bottom: 14px; }
+.dialog-row { display: flex; align-items: center; gap: 12px; margin: 4px 0 6px; }
+.dialog-row label { color: #647187; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.dialog-select { width: 160px; }
+.export-issues { margin-top: 12px; padding: 11px 12px; border: 1px solid #f0ddae; border-radius: 9px; background: #fdf6e4; }
+.export-issues-title { margin: 0 0 8px; color: #8a6414; font-size: 12px; font-weight: 700; }
+.issue-group { margin: 7px 0; font-size: 12px; }
+.issue-group b { display: block; margin-bottom: 4px; color: #735c16; }
+.cue-ref { display: inline-block; margin: 0 5px 4px 0; padding: 1px 7px; border-radius: 5px; color: #59480f; background: #f7ebc9; font-family: ui-monospace, monospace; font-size: 11px; }
+.export-clean { margin: 12px 0 2px; color: #358268; font-size: 12px; }
+.pending-card { margin-bottom: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.pending-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.pending-ref { color: #8793a7; font-size: 11px; }
+.pending-time { display: block; color: #66748a; font-size: 10px; }
+.pending-text { margin: 6px 0 10px; color: #1d2b41; font-size: 13px; line-height: 1.5; }
+.pending-select { width: 100%; }
+.pending-actions { display: flex; gap: 8px; margin-top: 9px; }
+.pending-actions .el-button { margin-left: 0; }
 @media (max-width: 1380px) {
   .workspace { grid-template-columns: 224px minmax(580px, 1fr) 330px; }
   .shortcut-bar { left: 224px; right: 330px; }

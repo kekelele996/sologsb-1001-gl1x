@@ -1,4 +1,4 @@
-import type { Cue } from '../types'
+import type { Cue, ImportedEntry } from '../types'
 import { makeId } from './id'
 
 export const formatTime = (seconds: number, separator = ','): string => {
@@ -18,9 +18,10 @@ export const parseTime = (value: string): number => {
   return Number(normalized) || 0
 }
 
-export const parseSrt = (text: string, actorId = 'actor-narrator'): Cue[] => {
+/** 解析 SRT 为轻量条目（保留文件内顺序），供译文匹配导入使用 */
+export const parseSrtEntries = (text: string): ImportedEntry[] => {
   const blocks = text.replace(/\r/g, '').split(/\n{2,}/)
-  const parsed: Cue[] = []
+  const entries: ImportedEntry[] = []
   for (const block of blocks) {
     const lines = block.split('\n').filter(Boolean)
     const timeLineIndex = lines.findIndex((line) => line.includes('-->'))
@@ -28,48 +29,44 @@ export const parseSrt = (text: string, actorId = 'actor-narrator'): Cue[] => {
     const [from, to] = lines[timeLineIndex].split('-->').map((part) => part.trim().split(' ')[0])
     const content = lines.slice(timeLineIndex + 1).join('\n').trim()
     if (!content) continue
-    parsed.push({
-      id: makeId('cue'),
-      start: parseTime(from),
-      end: parseTime(to),
-      source: content,
-      target: '',
-      actorId,
-      speed: 1,
-      termIds: [],
-      status: 'draft',
-      locked: false,
-    })
+    entries.push({ index: entries.length + 1, start: parseTime(from), end: parseTime(to), text: content })
   }
-  return parsed
+  return entries
 }
+
+const emptyCue = (start: number, end: number, source: string, actorId: string): Cue => ({
+  id: makeId('cue'),
+  start,
+  end,
+  source,
+  translations: {},
+  actorId,
+  speed: 1,
+  termIds: [],
+  status: 'draft',
+  locked: false,
+})
+
+export const parseSrt = (text: string, actorId = 'actor-narrator'): Cue[] =>
+  parseSrtEntries(text).map((entry) => emptyCue(entry.start, entry.end, entry.text, actorId))
 
 export const parseScript = (text: string, actors: { id: string; name: string }[]): Cue[] => {
   const lines = text.replace(/\r/g, '').split('\n').map((line) => line.trim()).filter(Boolean)
-  const result: Cue[] = []
-  lines.forEach((line, index) => {
+  return lines.map((line, index) => {
     const match = line.match(/^([^：:]{1,18})[：:]\s*(.+)$/)
     const actorName = match?.[1]?.trim()
     const content = match?.[2]?.trim() || line
     const actor = actors.find((item) => item.name === actorName) ?? actors[0]
-    result.push({
-      id: makeId('cue'),
-      start: index * 4,
-      end: index * 4 + 3.5,
-      source: content,
-      target: '',
-      actorId: actor?.id ?? 'actor-narrator',
-      speed: 1,
-      termIds: [],
-      status: 'draft',
-      locked: false,
-    })
+    return emptyCue(index * 4, index * 4 + 3.5, content, actor?.id ?? 'actor-narrator')
   })
-  return result
 }
 
-export const toSrt = (cues: Cue[]): string =>
+/** 导出指定语言的 SRT；无译文时回退为原文（涉及项会在导出前单独提示） */
+export const toSrt = (cues: Cue[], language: string): string =>
   [...cues]
     .sort((a, b) => a.start - b.start)
-    .map((cue, index) => `${index + 1}\n${formatTime(cue.start)} --> ${formatTime(cue.end)}\n${cue.target || cue.source}`)
+    .map((cue, index) => {
+      const text = cue.translations[language]?.text.trim() || cue.source
+      return `${index + 1}\n${formatTime(cue.start)} --> ${formatTime(cue.end)}\n${text}`
+    })
     .join('\n\n') + '\n'

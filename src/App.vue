@@ -4,27 +4,35 @@ import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Clock, Delete, DocumentCopy, Download, EditPen, Files, Lock, MagicStick, Monitor,
-  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled,
+  RefreshLeft, RefreshRight, Search, Unlock, UploadFilled, Warning,
 } from '@element-plus/icons-vue'
 import { useEditorStore } from './store/editor'
-import type { Cue, CueConflict } from './types'
+import type { Cue, CueConflict, PendingItem } from './types'
 import { formatTime } from './utils/subtitle'
+import type { MessageKey } from './i18n'
 
 const store = useEditorStore()
-const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter } = storeToRefs(store)
+const { document: project, selectedCue, selectedCueId, visibleCues, saveState, conflict, online, timelineZoom, actorFilter, activeTargetLang } = storeToRefs(store)
 const fileInput = ref<HTMLInputElement>()
 const snapshotDialog = ref(false)
 const snapshotName = ref('')
 const search = ref('')
 
+const LANGUAGE_KEYS: Record<string, MessageKey> = { zh: 'langZh', en: 'langEn', ja: 'langJa' }
+const langName = (code: string) => LANGUAGE_KEYS[code] ? store.t(LANGUAGE_KEYS[code]) : code
+const translationOf = (cue: Cue) => cue.translations[activeTargetLang.value]
+const translationText = (cue: Cue) => translationOf(cue)?.text.trim() ?? ''
+
 const filteredCues = computed(() => {
   const query = search.value.trim().toLowerCase()
   if (!query) return visibleCues.value
-  return visibleCues.value.filter((cue) => `${cue.source} ${cue.target}`.toLowerCase().includes(query))
+  return visibleCues.value.filter((cue) =>
+    [cue.source, ...Object.values(cue.translations).map((item) => item.text)].join(' ').toLowerCase().includes(query))
 })
 const selectedWarnings = computed(() => selectedCue.value ? cueWarnings(selectedCue.value) : [])
 const selectedTermMismatches = computed(() => selectedCue.value ? termMismatches(selectedCue.value) : [])
-const totalCharacters = computed(() => project.value.cues.reduce((sum, cue) => sum + cue.source.length + cue.target.length, 0))
+const selectedTranslation = computed(() => selectedCue.value?.translations[activeTargetLang.value])
+const totalCharacters = computed(() => project.value.cues.reduce((sum, cue) => sum + cue.source.length + Object.values(cue.translations).reduce((acc, item) => acc + item.text.length, 0), 0))
 const saveLabel = computed(() => ({
   saved: store.t('saved'), dirty: store.t('dirty'), saving: store.t('saving'), conflict: store.t('conflict'),
 }[saveState.value]))
@@ -32,9 +40,19 @@ const actorColor = (id: string) => project.value.actors.find((actor) => actor.id
 const actorName = (id: string) => project.value.actors.find((actor) => actor.id === id)?.name ?? '—'
 const statusLabel = (status: Cue['status']) => store.t(status)
 const statusType = (status: Cue['status']) => status === 'reviewed' ? 'success' : status === 'issue' ? 'danger' : 'info'
+const cueNumber = (id: string | null) => {
+  const index = project.value.cues.findIndex((cue) => cue.id === id)
+  return index >= 0 ? `#${index + 1}` : '—'
+}
 
 function updateSelected(patch: Partial<Cue>, label = 'update-cue') {
-  if (selectedCue.value) store.updateCue(selectedCue.value.id, patch, label)
+  if (!selectedCue.value) return
+  const hadConfirmed = Object.values(selectedCue.value.translations).some((item) => item.text.trim() && item.state === 'confirmed')
+  store.updateCue(selectedCue.value.id, patch, label)
+  if (hadConfirmed && (patch.start !== undefined || patch.end !== undefined)) ElMessage.info(store.t('timecodeReset'))
+}
+function updateTranslation(text: string) {
+  if (selectedCue.value) store.updateTranslation(selectedCue.value.id, activeTargetLang.value, String(text))
 }
 function tone(text: string) {
   const polite = (text.match(/您|请|劳驾|麻烦|敬请/g) ?? []).length
@@ -54,8 +72,8 @@ function cueWarnings(cue: Cue): CueConflict[] {
   const warnings: CueConflict[] = []
   if (!previous) return warnings
   if (previous.actorId !== cue.actorId) warnings.push({ cueId: cue.id, type: 'actor', message: store.t('actorSwitch', { from: actorName(previous.actorId), to: actorName(cue.actorId) }) })
-  const fromTone = tone(previous.target || previous.source)
-  const currentTone = tone(cue.target || cue.source)
+  const fromTone = tone(translationText(previous) || previous.source)
+  const currentTone = tone(translationText(cue) || cue.source)
   if (fromTone !== 'neutral' && currentTone !== 'neutral' && fromTone !== currentTone) warnings.push({ cueId: cue.id, type: 'tone', message: store.t('toneSwitch', { from: fromTone, to: currentTone }) })
   const fromAddress = addressee(previous.source)
   const currentAddress = addressee(cue.source)
@@ -64,21 +82,93 @@ function cueWarnings(cue: Cue): CueConflict[] {
   return warnings
 }
 function termMismatches(cue: Cue) {
-  return project.value.terms.filter((term) => cue.termIds.includes(term.id) && cue.target && !cue.target.includes(term.target))
+  const text = translationText(cue)
+  return project.value.terms.filter((term) => cue.termIds.includes(term.id) && text && !text.includes(term.target))
 }
+
+// ---- 导入：先选文件，再决定作为底稿还是按语言归入译文 ----
+const importDialog = ref(false)
+const importMode = ref<'base' | 'translation'>('translation')
+const importLang = ref('en')
+const pendingFile = ref<{ name: string; text: string } | null>(null)
+
 async function importFile(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
   try {
-    const count = store.importText(await file.text(), file.name)
-    ElMessage.success(store.t('importDone', { count }))
+    pendingFile.value = { name: file.name, text: await file.text() }
+    importMode.value = file.name.toLowerCase().endsWith('.srt') ? 'translation' : 'base'
+    importDialog.value = true
   } catch {
     ElMessage.error(store.t('importError'))
   } finally {
     input.value = ''
   }
 }
+function confirmImport() {
+  const file = pendingFile.value
+  importDialog.value = false
+  if (!file) return
+  try {
+    if (importMode.value === 'base') {
+      const count = store.importText(file.text, file.name)
+      ElMessage.success(store.t('importDone', { count }))
+    } else {
+      const result = store.importTranslation(file.text, importLang.value)
+      ElMessage.success(store.t('importResult', result))
+      if (result.pending > 0) pendingDrawer.value = true
+    }
+  } catch {
+    ElMessage.error(store.t('importError'))
+  }
+}
+
+// ---- 导出：按语言导出，导出前指出空译文与待确认项 ----
+const exportDialog = ref(false)
+const exportLang = ref('en')
+const exportIssues = computed(() => store.exportIssues(exportLang.value))
+const hasExportIssues = computed(() => {
+  const issues = exportIssues.value
+  return issues.empty.length > 0 || issues.pending.length > 0 || issues.openItems.length > 0
+})
+function openExport() {
+  if (!project.value.targetLanguages.includes(exportLang.value)) exportLang.value = activeTargetLang.value
+  exportDialog.value = true
+}
+function confirmExport() {
+  store.exportSrt(exportLang.value)
+  exportDialog.value = false
+}
+const pendingItemLabel = (item: PendingItem) =>
+  item.importedIndex != null ? store.t('importedLine', { index: item.importedIndex }) : `${store.t('reasonMissing')} ${cueNumber(item.cueId)}`
+
+// ---- 待确认抽屉：校对员指定归属 ----
+const pendingDrawer = ref(false)
+const pendingChoices = ref<Record<string, string>>({})
+const openItems = computed(() => store.openPendingItems)
+const openImportedLines = (language: string) => openItems.value.filter((item) => item.language === language && item.importedText != null)
+const REASON_KEYS: Record<PendingItem['reason'], MessageKey> = {
+  ambiguous: 'reasonAmbiguous', shifted: 'reasonShifted', unmatched: 'reasonUnmatched', missing: 'reasonMissing',
+}
+const reasonType = (reason: PendingItem['reason']) =>
+  reason === 'ambiguous' ? 'warning' : reason === 'shifted' ? 'warning' : reason === 'unmatched' ? 'danger' : 'info'
+function cueOptionLabel(id: string) {
+  const index = project.value.cues.findIndex((cue) => cue.id === id)
+  const cue = project.value.cues[index]
+  if (!cue) return '—'
+  return `#${index + 1} · ${formatTime(cue.start)} · ${cue.source.slice(0, 24)}`
+}
+function assignPending(item: PendingItem) {
+  const choice = pendingChoices.value[item.id] ?? (item.reason === 'missing' ? '' : item.cueId ?? '')
+  if (!choice) return
+  if (item.reason === 'missing') store.resolveMissingWithImport(item.id, choice)
+  else store.resolvePendingAssign(item.id, choice)
+}
+function dismissPending(item: PendingItem) {
+  store.resolvePendingDismiss(item.id)
+}
+
 function requestDelete(id: string) {
   ElMessageBox.confirm(store.t('confirmDelete'), { type: 'warning', confirmButtonText: store.t('delete') })
     .then(() => store.deleteCue(id))
@@ -145,7 +235,10 @@ const handleOffline = () => setOnline(false)
         <span class="save-state" :class="saveState"><i />{{ saveLabel }}</span>
         <input ref="fileInput" class="file-input" type="file" accept=".srt,.txt,text/plain" @change="importFile" />
         <el-button :icon="UploadFilled" @click="fileInput?.click()">{{ store.t('import') }}</el-button>
-        <el-button :icon="Download" @click="store.exportSrt">{{ store.t('export') }}</el-button>
+        <el-badge :value="store.openPendingCount" :hidden="!store.openPendingCount" :max="99">
+          <el-button :icon="Warning" @click="pendingDrawer = true">{{ store.t('pending') }}</el-button>
+        </el-badge>
+        <el-button :icon="Download" @click="openExport">{{ store.t('export') }}</el-button>
         <el-button type="primary" :icon="DocumentCopy" @click="snapshotDialog = true">{{ store.t('snapshot') }}</el-button>
       </div>
     </header>
@@ -218,7 +311,7 @@ const handleOffline = () => setOnline(false)
                 v-for="cue in filteredCues" :key="cue.id" class="timeline-block" :class="{ active: cue.id === selectedCueId, issue: cue.status === 'issue', locked: cue.locked }"
                 :style="{ left: `${(cue.start / store.totalDuration) * 100}%`, width: `${Math.max(1.8, ((cue.end - cue.start) / store.totalDuration) * 100)}%`, borderColor: actorColor(cue.actorId) }"
                 :title="`${formatTime(cue.start)} · ${cue.source}`" @click="store.selectCue(cue.id)"
-              ><span>{{ actorName(cue.actorId).split('/')[0] }}</span><b>{{ cue.target || cue.source }}</b></button>
+              ><span>{{ actorName(cue.actorId).split('/')[0] }}</span><b>{{ translationText(cue) || cue.source }}</b></button>
               <div class="timeline-ruler"><span v-for="tick in [0, 15, 30, 45, 60]" :key="tick" :style="{ left: `${(tick / store.totalDuration) * 100}%` }">{{ tick }}s</span></div>
             </div>
           </div>
@@ -226,11 +319,17 @@ const handleOffline = () => setOnline(false)
 
         <div class="cue-toolbar">
           <div class="section-heading"><span>{{ store.t('cues') }}</span><el-tag size="small" type="info">{{ filteredCues.length }}</el-tag></div>
-          <el-input v-model="search" :prefix-icon="Search" clearable placeholder="搜索原文或译文" class="cue-search" />
-          <el-select v-model="actorFilter" class="actor-mobile-filter">
-            <el-option :label="store.t('allActors')" value="all" />
-            <el-option v-for="actor in project.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
-          </el-select>
+          <div class="cue-toolbar-right">
+            <label class="active-lang-label">{{ store.t('activeLang') }}</label>
+            <el-select :model-value="activeTargetLang" class="active-lang-select" @change="store.setActiveTargetLang(String($event))">
+              <el-option v-for="lang in project.targetLanguages" :key="lang" :label="langName(lang)" :value="lang" />
+            </el-select>
+            <el-input v-model="search" :prefix-icon="Search" clearable placeholder="搜索原文或译文" class="cue-search" />
+            <el-select v-model="actorFilter" class="actor-mobile-filter">
+              <el-option :label="store.t('allActors')" value="all" />
+              <el-option v-for="actor in project.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
+            </el-select>
+          </div>
         </div>
 
         <div class="cue-list">
@@ -245,10 +344,19 @@ const handleOffline = () => setOnline(false)
                 <code>{{ formatTime(cue.start) }} → {{ formatTime(cue.end) }}</code>
                 <el-tag size="small" :type="statusType(cue.status)">{{ statusLabel(cue.status) }}</el-tag>
                 <el-icon v-if="cue.locked"><Lock /></el-icon>
+                <span class="lang-chips">
+                  <i
+                    v-for="lang in project.targetLanguages" :key="lang" class="lang-chip"
+                    :class="{ filled: !!cue.translations[lang]?.text.trim(), pending: !!cue.translations[lang]?.text.trim() && cue.translations[lang].state === 'pending', current: lang === activeTargetLang }"
+                  >{{ lang.toUpperCase() }}</i>
+                </span>
                 <span class="cue-warning-count" v-if="cueWarnings(cue).length">{{ cueWarnings(cue).length }} context</span>
               </div>
               <p class="source-text">{{ cue.source }}</p>
-              <p class="target-text" :class="{ empty: !cue.target }">{{ cue.target || '尚未填写译文' }}</p>
+              <p class="target-text" :class="{ empty: !translationText(cue) }">
+                {{ translationText(cue) || store.t('noTranslation') }}
+                <el-tag v-if="translationText(cue) && translationOf(cue)?.state === 'pending'" size="small" type="warning" class="state-tag">{{ store.t('pendingReview') }}</el-tag>
+              </p>
             </div>
             <div class="cue-quick-actions">
               <el-button size="small" text :icon="MagicStick" @click.stop="store.splitCue(cue.id)">{{ store.t('split') }}</el-button>
@@ -279,8 +387,16 @@ const handleOffline = () => setOnline(false)
           </div>
           <label>{{ store.t('source') }}</label>
           <el-input :model-value="selectedCue.source" type="textarea" :rows="4" :disabled="selectedCue.locked" @change="updateSelected({ source: String($event) }, 'source-text')" />
-          <label>{{ store.t('target') }}</label>
-          <el-input :model-value="selectedCue.target" type="textarea" :rows="5" :disabled="selectedCue.locked" @change="updateSelected({ target: String($event) }, 'target-text')" />
+          <div class="translation-heading">
+            <label>{{ store.t('target') }}</label>
+            <el-select :model-value="activeTargetLang" size="small" class="inspector-lang-select" @change="store.setActiveTargetLang(String($event))">
+              <el-option v-for="lang in project.targetLanguages" :key="lang" :label="langName(lang)" :value="lang" />
+            </el-select>
+            <el-tag v-if="selectedTranslation?.text.trim()" size="small" :type="selectedTranslation.state === 'pending' ? 'warning' : 'success'">
+              {{ store.t(selectedTranslation.state === 'pending' ? 'pendingReview' : 'confirmed') }}
+            </el-tag>
+          </div>
+          <el-input :model-value="selectedTranslation?.text ?? ''" type="textarea" :rows="5" :disabled="selectedCue.locked" @change="updateTranslation" />
           <div class="two-columns">
             <div><label>{{ store.t('speed') }}</label><el-input-number :model-value="selectedCue.speed" :disabled="selectedCue.locked" :min="0.5" :max="1.8" :step="0.01" controls-position="right" @change="updateSelected({ speed: Number($event) }, 'speed')" /></div>
             <div><label>{{ store.t('status') }}</label><el-select :model-value="selectedCue.status" :disabled="selectedCue.locked" @change="store.markStatus(selectedCue.id, $event)"><el-option :label="store.t('draft')" value="draft" /><el-option :label="store.t('reviewed')" value="reviewed" /><el-option :label="store.t('issue')" value="issue" /></el-select></div>
@@ -329,5 +445,91 @@ const handleOffline = () => setOnline(false)
       </div>
       <template #footer><el-button type="primary" @click="createSnapshot">{{ store.t('snapshot') }}</el-button></template>
     </el-dialog>
+
+    <el-dialog v-model="importDialog" :title="store.t('importTitle')" width="520px">
+      <el-radio-group v-model="importMode" class="import-mode">
+        <el-radio value="translation">{{ store.t('importModeTranslation') }}</el-radio>
+        <el-radio value="base">{{ store.t('importModeBase') }}</el-radio>
+      </el-radio-group>
+      <div v-if="importMode === 'translation'" class="dialog-row">
+        <label>{{ store.t('importLanguage') }}</label>
+        <el-select v-model="importLang" class="dialog-select">
+          <el-option value="zh" :label="store.t('langZh')" />
+          <el-option value="en" :label="store.t('langEn')" />
+          <el-option value="ja" :label="store.t('langJa')" />
+        </el-select>
+      </div>
+      <template #footer>
+        <el-button @click="importDialog = false">{{ store.t('cancel') }}</el-button>
+        <el-button type="primary" @click="confirmImport">{{ store.t('confirmImport') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="exportDialog" :title="store.t('exportTitle')" width="560px">
+      <div class="dialog-row">
+        <label>{{ store.t('exportLanguage') }}</label>
+        <el-select v-model="exportLang" class="dialog-select">
+          <el-option v-for="lang in project.targetLanguages" :key="lang" :label="langName(lang)" :value="lang" />
+        </el-select>
+      </div>
+      <div v-if="hasExportIssues" class="export-issues">
+        <p class="export-issues-title">{{ store.t('exportIssuesFound') }}</p>
+        <div v-if="exportIssues.empty.length" class="issue-group">
+          <b>{{ exportIssues.empty.length }} {{ store.t('exportEmpty') }}</b>
+          <span v-for="id in exportIssues.empty" :key="id" class="cue-ref">{{ cueNumber(id) }}</span>
+        </div>
+        <div v-if="exportIssues.pending.length" class="issue-group">
+          <b>{{ exportIssues.pending.length }} {{ store.t('exportPendingState') }}</b>
+          <span v-for="id in exportIssues.pending" :key="id" class="cue-ref">{{ cueNumber(id) }}</span>
+        </div>
+        <div v-if="exportIssues.openItems.length" class="issue-group">
+          <b>{{ exportIssues.openItems.length }} {{ store.t('exportOpenItems') }}</b>
+          <span v-for="item in exportIssues.openItems" :key="item.id" class="cue-ref">{{ pendingItemLabel(item) }}</span>
+        </div>
+      </div>
+      <p v-else class="export-clean">{{ store.t('exportClean') }}</p>
+      <template #footer>
+        <el-button @click="exportDialog = false">{{ store.t('cancel') }}</el-button>
+        <el-button :type="hasExportIssues ? 'warning' : 'primary'" @click="confirmExport">{{ hasExportIssues ? store.t('exportAnyway') : store.t('exportNow') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <el-drawer v-model="pendingDrawer" :title="store.t('pendingTitle')" size="460px">
+      <div v-if="!openItems.length" class="empty-state">{{ store.t('pendingEmpty') }}</div>
+      <div v-for="item in openItems" :key="item.id" class="pending-card">
+        <div class="pending-head">
+          <el-tag size="small" effect="plain">{{ langName(item.language) }}</el-tag>
+          <el-tag size="small" :type="reasonType(item.reason)">{{ store.t(REASON_KEYS[item.reason]) }}</el-tag>
+          <span v-if="item.importedIndex != null" class="pending-ref">{{ store.t('importedLine', { index: item.importedIndex }) }}</span>
+        </div>
+        <template v-if="item.importedText != null">
+          <code class="pending-time">{{ formatTime(item.importedStart ?? 0) }} → {{ formatTime(item.importedEnd ?? 0) }}</code>
+          <p class="pending-text">{{ item.importedText }}</p>
+          <el-select
+            :model-value="pendingChoices[item.id] ?? item.cueId ?? ''" :placeholder="store.t('chooseCue')" class="pending-select"
+            @update:model-value="pendingChoices[item.id] = String($event)"
+          >
+            <el-option v-for="cue in project.cues" :key="cue.id" :label="cueOptionLabel(cue.id)" :value="cue.id" />
+          </el-select>
+          <div class="pending-actions">
+            <el-button size="small" type="primary" @click="assignPending(item)">{{ store.t('assign') }}</el-button>
+            <el-button size="small" text @click="dismissPending(item)">{{ store.t('discardLine') }}</el-button>
+          </div>
+        </template>
+        <template v-else>
+          <p class="pending-text">{{ store.t('missingFor') }}：{{ cueOptionLabel(item.cueId ?? '') }}</p>
+          <el-select
+            :model-value="pendingChoices[item.id] ?? ''" :placeholder="store.t('chooseLine')" class="pending-select"
+            @update:model-value="pendingChoices[item.id] = String($event)"
+          >
+            <el-option v-for="line in openImportedLines(item.language)" :key="line.id" :label="`#${line.importedIndex} · ${(line.importedText ?? '').slice(0, 24)}`" :value="line.id" />
+          </el-select>
+          <div class="pending-actions">
+            <el-button size="small" type="primary" :disabled="!(pendingChoices[item.id])" @click="assignPending(item)">{{ store.t('assign') }}</el-button>
+            <el-button size="small" text @click="dismissPending(item)">{{ store.t('keepEmpty') }}</el-button>
+          </div>
+        </template>
+      </div>
+    </el-drawer>
   </div>
 </template>
